@@ -111,18 +111,31 @@ def _estimate_block_font_size(block_rect: fitz.Rect, spans: list[tuple[fitz.Rect
     return sum(size * area for size, area in weighted_sizes) / total_area
 
 
+def extract_cover_image(pdf_path: Path, cover_path: Path) -> None:
+    """將 PDF 第一頁（第 0 頁）渲染為封面圖片。"""
+    with fitz.open(pdf_path) as doc:
+        if len(doc) == 0:
+            return
+
+        page = doc[0]
+        pix = page.get_pixmap(dpi=150)
+        cover_path.parent.mkdir(parents=True, exist_ok=True)
+        pix.save(str(cover_path))
+
+
 def extract_blocks_from_pdf(pdf_path: Path) -> list[TextBlock]:
     """
     使用 page.get_text('blocks') 讀取 PDF，並補充字體大小資訊。
 
     blocks 格式：(x0, y0, x1, y1, text, block_no, block_type)
     block_type == 0 表示文字區塊。
+    第一頁作為封面，內文從第二頁開始解析。
     """
     blocks: list[TextBlock] = []
 
     with fitz.open(pdf_path) as doc:
-        for page_index, page in enumerate(doc):
-            page_rect = page.rect
+        for page_index in range(1, len(doc)):
+            page = doc[page_index]
             span_fonts = _collect_span_font_sizes(page)
             raw_blocks = page.get_text("blocks")
 
@@ -293,8 +306,8 @@ def clean_and_structure_blocks(blocks: list[TextBlock], pdf_path: Path, config: 
     page_heights: dict[int, float] = {}
 
     with fitz.open(pdf_path) as doc:
-        for index, page in enumerate(doc):
-            page_heights[index] = page.rect.height
+        for index in range(1, len(doc)):
+            page_heights[index] = doc[index].rect.height
 
     filtered = filter_header_footer(blocks, page_heights, config)
     classify_headings(filtered)
@@ -361,7 +374,12 @@ def _split_blocks_into_chapters(blocks: list[TextBlock], blocks_per_chapter: int
     return [blocks[i : i + blocks_per_chapter] for i in range(0, len(blocks), blocks_per_chapter)]
 
 
-def build_epub(blocks: list[TextBlock], output_path: Path, config: ConversionConfig) -> None:
+def build_epub(
+    blocks: list[TextBlock],
+    output_path: Path,
+    config: ConversionConfig,
+    cover_path: Path | None = None,
+) -> None:
     """使用 ebooklib 建立 EPUB 檔案。"""
     book = epub.EpubBook()
     book.set_identifier(f"pdf2epub-{output_path.stem}")
@@ -369,8 +387,21 @@ def build_epub(blocks: list[TextBlock], output_path: Path, config: ConversionCon
     book.set_language(config.language)
     book.add_author(config.author)
 
+    cover_page_id: str | None = None
+    if cover_path and cover_path.is_file():
+        with open(cover_path, "rb") as cover_file:
+            book.set_cover("cover.png", cover_file.read())
+
+        cover_page = book.get_item_with_id("cover")
+        if cover_page is not None:
+            cover_page.is_linear = True
+            cover_page_id = "cover"
+
     chapters = _split_blocks_into_chapters(blocks)
-    spine: list[epub.EpubItem | str] = ["nav"]
+    spine: list[epub.EpubItem | str] = []
+    if cover_page_id:
+        spine.append(cover_page_id)
+    spine.append("nav")
     toc: list[epub.Link] = []
 
     for index, chapter_blocks in enumerate(chapters, start=1):
@@ -416,21 +447,34 @@ def convert_pdf_to_epub(pdf_path: Path, epub_path: Path, config: ConversionConfi
     if not config.title:
         config.title = pdf_path.stem
 
-    print(f"[1/3] 解析 PDF：{pdf_path}")
-    raw_blocks = extract_blocks_from_pdf(pdf_path)
-    print(f"      讀取 {len(raw_blocks)} 個文字區塊")
+    cover_path = epub_path.parent / "cover.png"
 
-    print("[2/3] 清理結構並辨識標題")
-    structured_blocks = clean_and_structure_blocks(raw_blocks, pdf_path, config)
-    heading_count = sum(1 for block in structured_blocks if block.is_heading)
-    print(f"      保留 {len(structured_blocks)} 個區塊，其中標題 {heading_count} 個")
+    try:
+        print(f"[1/4] 提取封面：{pdf_path} 第 1 頁")
+        extract_cover_image(pdf_path, cover_path)
+        if cover_path.is_file():
+            print(f"      已儲存封面：{cover_path}")
+        else:
+            print("      PDF 無頁面，略過封面")
 
-    if not structured_blocks:
-        raise ValueError("未從 PDF 提取到可用文字，無法建立 EPUB")
+        print(f"[2/4] 解析 PDF 內文：{pdf_path}")
+        raw_blocks = extract_blocks_from_pdf(pdf_path)
+        print(f"      讀取 {len(raw_blocks)} 個文字區塊（已跳過封面頁）")
 
-    print(f"[3/3] 封裝 EPUB：{epub_path}")
-    build_epub(structured_blocks, epub_path, config)
-    print("轉換完成。")
+        print("[3/4] 清理結構並辨識標題")
+        structured_blocks = clean_and_structure_blocks(raw_blocks, pdf_path, config)
+        heading_count = sum(1 for block in structured_blocks if block.is_heading)
+        print(f"      保留 {len(structured_blocks)} 個區塊，其中標題 {heading_count} 個")
+
+        if not structured_blocks:
+            raise ValueError("未從 PDF 提取到可用文字，無法建立 EPUB")
+
+        print(f"[4/4] 封裝 EPUB：{epub_path}")
+        build_epub(structured_blocks, epub_path, config, cover_path=cover_path)
+        print("轉換完成。")
+    finally:
+        if cover_path.is_file():
+            cover_path.unlink()
 
 
 def parse_args() -> argparse.Namespace:
