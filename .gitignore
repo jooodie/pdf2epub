@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# 使用者資料（不提交 PDF/EPUB）
+*.pdf
+*.epub
+*.zip
